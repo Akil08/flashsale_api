@@ -3,7 +3,9 @@ using FlashSale.Api.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 using System.Security.Claims;
+using System.Text.Json;
 
 namespace FlashSale.Api.Controllers;
 
@@ -30,57 +32,100 @@ public class PurchasesController : ControllerBase
             return Unauthorized(new { error = "Invalid user token." });
         }
 
-        // 1. Fetch sale ONLY to check time rules (we no longer read Stock for the update logic)
+        var idempotencyKey = Request.Headers["Idempotency-Key"].FirstOrDefault();
+        if (string.IsNullOrEmpty(idempotencyKey))
+        {
+            return BadRequest(new { error = "Idempotency-Key header is required." });
+        }
+
+        var existingRecord = await _dbContext.IdempotencyRecords
+            .FirstOrDefaultAsync(r => r.Key == idempotencyKey && r.UserId == buyerId, cancellationToken);
+
+        if (existingRecord != null)
+        {
+            _logger.LogInformation("Idempotent replay for key {Key} by buyer {BuyerId}", idempotencyKey, buyerId);
+            // what is wrong ? can u give the right code ? jsut the code plz, no talk plz 
+            // Return the stored response body and status code for idempotent requests
+            return StatusCode(existingRecord.StatusCode, existingRecord.ResponseBody);
+            // return Content(existingRecord.ResponseBody, "application/json", (System.Net.HttpStatusCode)existingRecord.StatusCode);
+        }
+
         var sale = await _dbContext.FlashSales
             .Select(s => new { s.Id, s.StartsAt, s.EndsAt, s.Status })
             .FirstOrDefaultAsync(s => s.Id == saleId, cancellationToken);
 
-        if (sale == null)
-        {
-            return NotFound(new { error = "Flash sale not found." });
-        }
+        if (sale == null) return NotFound(new { error = "Flash sale not found." });
 
         var now = DateTime.UtcNow;
-        if (now < sale.StartsAt)
+        if (now < sale.StartsAt) return BadRequest(new { error = "Sale has not started yet." });
+        if (now > sale.EndsAt || sale.Status == SaleStatus.Closed) return BadRequest(new { error = "Sale has ended or is closed." });
+
+        using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
+
+        try
         {
-            return BadRequest(new { error = "Sale has not started yet." });
+            var rowsAffected = await _dbContext.FlashSales
+                .Where(s => s.Id == saleId && s.Stock > 0)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(s => s.Stock, s => s.Stock - 1)
+                    .SetProperty(s => s.SoldCount, s => s.SoldCount + 1), 
+                    cancellationToken);
+
+            if (rowsAffected == 0)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                _logger.LogWarning("Purchase rejected: Out of stock for sale {SaleId}", saleId);
+                return Conflict(new { error = "Item is out of stock." });
+            }
+
+            var purchase = new Purchase
+            {
+                FlashSaleId = saleId,
+                BuyerId = buyerId,
+                CreatedAt = now
+            };
+            _dbContext.Purchases.Add(purchase);
+
+            var responseObj = new { message = "Purchase successful", purchaseId = purchase.Id };
+            var responseJson = JsonSerializer.Serialize(responseObj);
+
+            var idempotencyRecord = new IdempotencyRecord
+            {
+                Key = idempotencyKey,
+                UserId = buyerId,
+                ResponseBody = responseJson,
+                StatusCode = 200,
+                CreatedAt = now
+            };
+            
+            // FIX: Add BOTH entities to the context BEFORE calling SaveChangesAsync
+            _dbContext.IdempotencyRecords.Add(idempotencyRecord);
+
+            // Save BOTH entities in a single database round-trip
+            await _dbContext.SaveChangesAsync(cancellationToken);
+
+            // Commit transaction only after both are successfully saved
+            await transaction.CommitAsync(cancellationToken);
+
+            _logger.LogInformation("Purchase successful for sale {SaleId} by buyer {BuyerId}", saleId, buyerId);
+            return Ok(responseObj);
         }
-        if (now > sale.EndsAt || sale.Status == SaleStatus.Closed)
+        catch (DbUpdateConcurrencyException)
         {
-            return BadRequest(new { error = "Sale has ended or is closed." });
+            await transaction.RollbackAsync(cancellationToken);
+            _logger.LogWarning("Concurrency conflict detected for sale {SaleId}", saleId);
+            return Conflict(new { error = "The sale was modified by another process. Please try again." });
         }
-
-        // 2. ATOMIC UPDATE: Let the database handle the check and decrement in one step.
-        // This translates to: UPDATE "FlashSales" SET "Stock" = "Stock" - 1, "SoldCount" = "SoldCount" + 1 
-        // WHERE "Id" = @saleId AND "Stock" > 0
-        var rowsAffected = await _dbContext.FlashSales
-            .Where(s => s.Id == saleId && s.Stock > 0)
-            .ExecuteUpdateAsync(setters => setters
-                .SetProperty(s => s.Stock, s => s.Stock - 1)
-                .SetProperty(s => s.SoldCount, s => s.SoldCount + 1), 
-                cancellationToken);
-
-        // 3. If 0 rows were affected, it means Stock was already 0 (or sale was deleted)
-        if (rowsAffected == 0)
+        catch (DbUpdateException ex) when (ex.InnerException is PostgresException pgEx && pgEx.SqlState == "23505")
         {
-            _logger.LogWarning("Purchase rejected: Out of stock for sale {SaleId}", saleId);
-            return Conflict(new { error = "Item is out of stock." });
+            await transaction.RollbackAsync(cancellationToken);
+            _logger.LogWarning("Duplicate purchase attempt blocked by DB for sale {SaleId} by buyer {BuyerId}", saleId, buyerId);
+            return Conflict(new { error = "You have already purchased this item." });
         }
-
-        // 4. Create the purchase record
-        var purchase = new Purchase
+        catch
         {
-            FlashSaleId = saleId,
-            BuyerId = buyerId,
-            CreatedAt = now
-        };
-        _dbContext.Purchases.Add(purchase);
-
-        // 5. Save the purchase record
-        await _dbContext.SaveChangesAsync(cancellationToken);
-
-        _logger.LogInformation("Purchase successful for sale {SaleId} by buyer {BuyerId}", saleId, buyerId);
-
-        return Ok(new { message = "Purchase successful", purchaseId = purchase.Id });
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 }
