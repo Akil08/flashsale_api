@@ -44,9 +44,24 @@ public class PurchasesController : ControllerBase
         if (existingRecord != null)
         {
             _logger.LogInformation("Idempotent replay for key {Key} by buyer {BuyerId}", idempotencyKey, buyerId);
-            // what is wrong ? can u give the right code ? jsut the code plz, no talk plz 
-            // Return the stored response body and status code for idempotent requests
-            return StatusCode(existingRecord.StatusCode, existingRecord.ResponseBody);
+            // thsi code gives erro in vscode , jsut give the correct one , can u  ?
+            // Argument 3: cannot convert from 'System.Net.HttpStatusCode' to 'System.Text.Encoding'CS1503
+            // enum System.Net.HttpStatusCode
+            // Contains the values of status codes defined for HTTP defined in RFC 2616 for HTTP 1.1.
+
+            /*
+            Argument 3: cannot convert from 'int' to 'System.Text.Encoding'CS1503
+(local variable) IdempotencyRecord? existingRecord
+'existingRecord' is not null here.
+            */ 
+            return new ContentResult
+            {
+                Content = existingRecord.ResponseBody,
+                ContentType = "application/json",
+                StatusCode = existingRecord.StatusCode
+            };
+
+            // return Content(existingRecord.ResponseBody, "application/json", (int)existingRecord.StatusCode);
             // return Content(existingRecord.ResponseBody, "application/json", (System.Net.HttpStatusCode)existingRecord.StatusCode);
         }
 
@@ -97,14 +112,32 @@ public class PurchasesController : ControllerBase
                 StatusCode = 200,
                 CreatedAt = now
             };
-            
-            // FIX: Add BOTH entities to the context BEFORE calling SaveChangesAsync
             _dbContext.IdempotencyRecords.Add(idempotencyRecord);
 
-            // Save BOTH entities in a single database round-trip
+            // --- OUTBOX MESSAGE CREATION ---
+            var outboxPayload = JsonSerializer.Serialize(new 
+            { 
+                purchaseId = purchase.Id, 
+                buyerId = buyerId, 
+                saleId = saleId 
+            });
+
+            var outboxMessage = new OutboxMessage
+            {
+                Type = "FlashSaleItemPurchased",
+                Payload = outboxPayload,
+                // in outbox table the payload is stirng, but in above code payload is obj,
+                // but we are serializing it to string before saving, so it's fine,cause then 
+                // its begin saved as strign ??
+                // yes, the payload is serialized to a JSON string before being saved in the OutboxMessage table.
+                CreatedAt = now
+            };
+            _dbContext.OutboxMessages.Add(outboxMessage);
+            // -------------------------------
+
+            // Save Purchase, IdempotencyRecord, AND OutboxMessage in ONE database round-trip
             await _dbContext.SaveChangesAsync(cancellationToken);
 
-            // Commit transaction only after both are successfully saved
             await transaction.CommitAsync(cancellationToken);
 
             _logger.LogInformation("Purchase successful for sale {SaleId} by buyer {BuyerId}", saleId, buyerId);
@@ -127,5 +160,17 @@ public class PurchasesController : ControllerBase
             await transaction.RollbackAsync(cancellationToken);
             throw;
         }
+    }
+
+    // Temporary endpoint to inspect outbox messages for testing
+    [HttpGet("outbox-test")]
+    [Authorize(Roles = "Admin")]
+    public async Task<IActionResult> GetOutbox()
+    {
+        var messages = await _dbContext.OutboxMessages
+            .OrderByDescending(m => m.CreatedAt)
+            .Take(5)
+            .ToListAsync();
+        return Ok(messages);
     }
 }
