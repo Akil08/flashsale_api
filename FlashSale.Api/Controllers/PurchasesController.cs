@@ -1,5 +1,6 @@
 using FlashSale.Api.Data;
 using FlashSale.Api.Models;
+using FlashSale.Api.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -15,11 +16,13 @@ namespace FlashSale.Api.Controllers;
 public class PurchasesController : ControllerBase
 {
     private readonly AppDbContext _dbContext;
+    private readonly IRedisService _redisService;
     private readonly ILogger<PurchasesController> _logger;
 
-    public PurchasesController(AppDbContext dbContext, ILogger<PurchasesController> logger)
+    public PurchasesController(AppDbContext dbContext, IRedisService redisService, ILogger<PurchasesController> logger)
     {
         _dbContext = dbContext;
+        _redisService = redisService;
         _logger = logger;
     }
 
@@ -30,6 +33,16 @@ public class PurchasesController : ControllerBase
         if (string.IsNullOrEmpty(userIdString) || !Guid.TryParse(userIdString, out var buyerId))
         {
             return Unauthorized(new { error = "Invalid user token." });
+        }
+
+        // 1. RATE LIMITING CHECK
+        var rateLimitKey = $"rate_limit:purchase:{buyerId}";
+        var requestCount = await _redisService.IncrementAsync(rateLimitKey, TimeSpan.FromSeconds(10), cancellationToken);
+
+        if (requestCount > 5)
+        {
+            _logger.LogWarning("Rate limit exceeded for buyer {BuyerId}", buyerId);
+            return StatusCode(429, new { error = "Too many requests. Please try again in 10 seconds." });
         }
 
         var idempotencyKey = Request.Headers["Idempotency-Key"].FirstOrDefault();
@@ -44,25 +57,12 @@ public class PurchasesController : ControllerBase
         if (existingRecord != null)
         {
             _logger.LogInformation("Idempotent replay for key {Key} by buyer {BuyerId}", idempotencyKey, buyerId);
-            // thsi code gives erro in vscode , jsut give the correct one , can u  ?
-            // Argument 3: cannot convert from 'System.Net.HttpStatusCode' to 'System.Text.Encoding'CS1503
-            // enum System.Net.HttpStatusCode
-            // Contains the values of status codes defined for HTTP defined in RFC 2616 for HTTP 1.1.
-
-            /*
-            Argument 3: cannot convert from 'int' to 'System.Text.Encoding'CS1503
-(local variable) IdempotencyRecord? existingRecord
-'existingRecord' is not null here.
-            */ 
             return new ContentResult
             {
                 Content = existingRecord.ResponseBody,
                 ContentType = "application/json",
                 StatusCode = existingRecord.StatusCode
             };
-
-            // return Content(existingRecord.ResponseBody, "application/json", (int)existingRecord.StatusCode);
-            // return Content(existingRecord.ResponseBody, "application/json", (System.Net.HttpStatusCode)existingRecord.StatusCode);
         }
 
         var sale = await _dbContext.FlashSales
@@ -114,7 +114,6 @@ public class PurchasesController : ControllerBase
             };
             _dbContext.IdempotencyRecords.Add(idempotencyRecord);
 
-            // --- OUTBOX MESSAGE CREATION ---
             var outboxPayload = JsonSerializer.Serialize(new 
             { 
                 purchaseId = purchase.Id, 
@@ -126,18 +125,11 @@ public class PurchasesController : ControllerBase
             {
                 Type = "FlashSaleItemPurchased",
                 Payload = outboxPayload,
-                // in outbox table the payload is stirng, but in above code payload is obj,
-                // but we are serializing it to string before saving, so it's fine,cause then 
-                // its begin saved as strign ??
-                // yes, the payload is serialized to a JSON string before being saved in the OutboxMessage table.
                 CreatedAt = now
             };
             _dbContext.OutboxMessages.Add(outboxMessage);
-            // -------------------------------
 
-            // Save Purchase, IdempotencyRecord, AND OutboxMessage in ONE database round-trip
             await _dbContext.SaveChangesAsync(cancellationToken);
-
             await transaction.CommitAsync(cancellationToken);
 
             _logger.LogInformation("Purchase successful for sale {SaleId} by buyer {BuyerId}", saleId, buyerId);
@@ -162,7 +154,6 @@ public class PurchasesController : ControllerBase
         }
     }
 
-    // Temporary endpoint to inspect outbox messages for testing
     [HttpGet("outbox-test")]
     [Authorize(Roles = "Admin")]
     public async Task<IActionResult> GetOutbox()
