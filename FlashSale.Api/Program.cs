@@ -8,6 +8,9 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using StackExchange.Redis;
+using Hangfire;
+using Hangfire.PostgreSql;
+using FlashSale.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,8 +19,25 @@ builder.Services.AddControllers();
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 
+
+// --- HANGFIRE CONFIGURATION ---
+var postgresConnectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
+    ?? throw new InvalidOperationException("DefaultConnection is not configured.");
+
+builder.Services.AddHangfire(config => config
+    .SetDataCompatibilityLevel(CompatibilityLevel.Version_170)
+    .UseSimpleAssemblyNameTypeSerializer()
+    .UseRecommendedSerializerSettings()
+    .UsePostgreSqlStorage(postgresConnectionString, new PostgreSqlStorageOptions
+    {
+        SchemaName = "hangfire", // Keeps Hangfire tables organized
+        QueuePollInterval = TimeSpan.FromSeconds(15) // Efficient polling
+    }));
+
+builder.Services.AddHangfireServer();
 builder.Services.AddScoped<IJwtService, JwtService>();
 builder.Services.AddHostedService<OutboxWorker>();
+builder.Services.AddScoped<SaleStatusUpdateService>();
 
 // --- BULLETPROOF REDIS CONFIGURATION ---
 var redisConnectionString = builder.Configuration.GetConnectionString("Redis") 
@@ -87,10 +107,31 @@ using (var scope = app.Services.CreateScope())
 }
 // --------------------------
 
+
+// Register the recurring job AFTER app is built
+using (var scope = app.Services.CreateScope())
+{
+    var recurringJobManager = scope.ServiceProvider.GetRequiredService<IRecurringJobManager>();
+    
+    // Schedule the job to run every 1 minute
+    recurringJobManager.AddOrUpdate<SaleStatusUpdateService>(
+        "update-sale-statuses",
+        service => service.UpdateSaleStatusesAsync(),
+        Cron.Minutely);
+}
+
+
 app.UseAuthentication();
 app.UseMiddleware<RequestLoggingMiddleware>();
 app.UseAuthorization();
 
+
+// Add Hangfire Dashboard (Optional, but great for debugging)
+// Note: In a real production app, you would secure this dashboard with authentication!
+app.UseHangfireDashboard("/hangfire");
+
 app.MapControllers();
+
+
 
 app.Run();

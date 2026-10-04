@@ -1,8 +1,10 @@
 using FlashSale.Api.Data;
 using FlashSale.Api.Models;
+using FlashSale.Api.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
 
 namespace FlashSale.Api.Controllers;
 
@@ -11,30 +13,44 @@ namespace FlashSale.Api.Controllers;
 public class SalesController : ControllerBase
 {
     private readonly AppDbContext _dbContext;
+    private readonly IRedisService _redisService;
     private readonly ILogger<SalesController> _logger;
 
-    public SalesController(AppDbContext dbContext, ILogger<SalesController> logger)
+    public SalesController(AppDbContext dbContext, IRedisService redisService, ILogger<SalesController> logger)
     {
         _dbContext = dbContext;
+        _redisService = redisService;
         _logger = logger;
     }
 
-    // --- PUBLIC ENDPOINT (No Auth Required) ---
+    // --- PUBLIC ENDPOINT (Cached) ---
     [HttpGet]
     public async Task<IActionResult> GetSales([FromQuery] string? search, CancellationToken cancellationToken)
-    {   
-       
-        //    
+    {
+        // 1. Create a unique cache key based on the search query
+        // so we just create a cache based on dynamic query ?
+        // This is a simple approach. For more complex queries, 
+        // consider hashing the query parameters to create a unique cache key.
+        var cacheKey = string.IsNullOrEmpty(search) ? "sales:all" : $"sales:search:{search.ToLower()}";
 
+        // 2. Try to get from Redis cache first
+        var cachedData = await _redisService.GetStringAsync(cacheKey, cancellationToken);
+        if (!string.IsNullOrEmpty(cachedData))
+        {
+            _logger.LogInformation("Cache HIT for {CacheKey}", cacheKey);
+            return Content(cachedData, "application/json");
+        }
+
+        _logger.LogInformation("Cache MISS for {CacheKey}. Fetching from DB.", cacheKey);
+
+        // 3. Fetch from database if not in cache
         var query = _dbContext.FlashSales.AsQueryable();
 
-        // Optional fuzzy search (will be upgraded to pg_trgm in Step 29)
         if (!string.IsNullOrWhiteSpace(search))
         {
             query = query.Where(s => s.Name.Contains(search) || s.Description.Contains(search));
         }
 
-        // For now, just return all matching sales ordered by start date
         var sales = await query
             .OrderBy(s => s.StartsAt)
             .Select(s => new 
@@ -50,6 +66,12 @@ public class SalesController : ControllerBase
                 s.Status
             })
             .ToListAsync(cancellationToken);
+
+        // 4. FIX: Force Web defaults (camelCase) for Redis serialization to match ASP.NET Core's Ok() behavior
+        var serializerOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var jsonData = JsonSerializer.Serialize(sales, serializerOptions);
+        
+        await _redisService.SetStringAsync(cacheKey, jsonData, TimeSpan.FromSeconds(10), cancellationToken);
 
         return Ok(sales);
     }
@@ -77,6 +99,9 @@ public class SalesController : ControllerBase
 
         _dbContext.FlashSales.Add(newSale);
         await _dbContext.SaveChangesAsync(cancellationToken);
+
+        // Invalidate the "sales:all" cache when a new sale is created
+        await _redisService.DeleteAsync("sales:all", cancellationToken);
 
         _logger.LogInformation("Admin created new flash sale: {SaleId} - {Name}", newSale.Id, newSale.Name);
 
