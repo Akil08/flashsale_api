@@ -10,7 +10,6 @@ using Microsoft.IdentityModel.Tokens;
 using StackExchange.Redis;
 using Hangfire;
 using Hangfire.PostgreSql;
-using FlashSale.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -19,46 +18,44 @@ builder.Services.AddControllers();
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 
-
-// --- HANGFIRE CONFIGURATION ---
-var postgresConnectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
-    ?? throw new InvalidOperationException("DefaultConnection is not configured.");
-
-builder.Services.AddHangfire(config => config
-    .SetDataCompatibilityLevel(CompatibilityLevel.Version_170)
-    .UseSimpleAssemblyNameTypeSerializer()
-    .UseRecommendedSerializerSettings()
-    .UsePostgreSqlStorage(postgresConnectionString, new PostgreSqlStorageOptions
-    {
-        SchemaName = "hangfire", // Keeps Hangfire tables organized
-        QueuePollInterval = TimeSpan.FromSeconds(15) // Efficient polling
-    }));
-
-builder.Services.AddHangfireServer();
 builder.Services.AddScoped<IJwtService, JwtService>();
 builder.Services.AddHostedService<OutboxWorker>();
-builder.Services.AddScoped<SaleStatusUpdateService>();
 
-// --- BULLETPROOF REDIS CONFIGURATION ---
+// --- REDIS CONFIGURATION ---
 var redisConnectionString = builder.Configuration.GetConnectionString("Redis") 
     ?? throw new InvalidOperationException("Redis connection string is not configured.");
 
-// 1. Parse the connection string into a ConfigurationOptions object
 var redisConfig = ConfigurationOptions.Parse(redisConnectionString);
-
-// 2. CRITICAL: Prevent the app from crashing on startup if Redis is temporarily unreachable
 redisConfig.AbortOnConnectFail = false;
 redisConfig.ConnectRetry = 5;
-
-// 3. Ensure TLS/SSL is enabled (Upstash requires this)
 redisConfig.Ssl = true;
 
-// 4. Register the Singleton using the CONFIG OBJECT, not the raw string
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp => 
     ConnectionMultiplexer.Connect(redisConfig));
 
 builder.Services.AddScoped<IRedisService, RedisService>();
-// ---------------------------------------
+// ---------------------------
+
+// --- HANGFIRE CONFIGURATION ---
+// SKIP Hangfire entirely during integration tests
+if (!builder.Environment.IsEnvironment("Testing"))
+{
+    var postgresConnectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
+        ?? throw new InvalidOperationException("DefaultConnection is not configured.");
+
+    builder.Services.AddHangfire(config => config
+        .SetDataCompatibilityLevel(CompatibilityLevel.Version_170)
+        .UseSimpleAssemblyNameTypeSerializer()
+        .UseRecommendedSerializerSettings()
+        .UsePostgreSqlStorage(postgresConnectionString, new PostgreSqlStorageOptions
+        {
+            SchemaName = "hangfire",
+            QueuePollInterval = TimeSpan.FromSeconds(15)
+        }));
+
+    builder.Services.AddHangfireServer();
+}
+// ------------------------------
 
 var secretKey = builder.Configuration["Jwt:SecretKey"] 
     ?? throw new InvalidOperationException("JWT SecretKey is not configured.");
@@ -88,52 +85,57 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    var admin = db.Users.FirstOrDefault(u => u.Email == "admin@test.com");
-    if (admin == null)
+    
+    // Only seed if the database is reachable (prevents test startup crashes)
+    if (await db.Database.CanConnectAsync())
     {
-        admin = new User
+        var admin = await db.Users.FirstOrDefaultAsync(u => u.Email == "admin@test.com");
+        if (admin == null)
         {
-            Email = "admin@test.com",
-            PasswordHash = PasswordHasher.HashPassword("AdminPass123!"),
-            Role = UserRole.Admin
-        };
-        db.Users.Add(admin);
+            admin = new User
+            {
+                Email = "admin@test.com",
+                PasswordHash = PasswordHasher.HashPassword("AdminPass123!"),
+                Role = UserRole.Admin
+            };
+            db.Users.Add(admin);
+        }
+        else
+        {
+            admin.Role = UserRole.Admin;
+        }
+        await db.SaveChangesAsync();
     }
-    else
-    {
-        admin.Role = UserRole.Admin;
-    }
-    db.SaveChanges();
 }
 // --------------------------
-
-
-// Register the recurring job AFTER app is built
-using (var scope = app.Services.CreateScope())
-{
-    var recurringJobManager = scope.ServiceProvider.GetRequiredService<IRecurringJobManager>();
-    
-    // Schedule the job to run every 1 minute
-    recurringJobManager.AddOrUpdate<SaleStatusUpdateService>(
-        "update-sale-statuses",
-        service => service.UpdateSaleStatusesAsync(),
-        Cron.Minutely);
-}
-
 
 app.UseAuthentication();
 app.UseMiddleware<RequestLoggingMiddleware>();
 app.UseAuthorization();
 
-
-// Add Hangfire Dashboard (Optional, but great for debugging)
-// Note: In a real production app, you would secure this dashboard with authentication!
-app.UseHangfireDashboard("/hangfire");
+// --- HANGFIRE DASHBOARD & JOBS ---
+// SKIP Dashboard and Job registration during integration tests
+if (!app.Environment.IsEnvironment("Testing"))
+{
+    app.UseHangfireDashboard("/hangfire");
+    
+    var recurringJobManager = app.Services.GetService<IRecurringJobManager>();
+    if (recurringJobManager != null)
+    {
+        recurringJobManager.AddOrUpdate<SaleStatusUpdateService>(
+            "update-sale-statuses",
+            // belwo line show erorr, what is the fix ? jsut give the fix code
+            service => service.UpdateSaleStatusesAsync(), // Note: adjust method name if yours is UpdateSaleStatusesAsync
+            // service => service.UpdateSaleStatusesAsync(), // Note: adjust method name if yours is UpdateSaleStatusesAsync
+            // service => service.UpdateStatusesAsync(), // Note: adjust method name if yours is UpdateSaleStatusesAsync
+            Cron.Minutely);
+    }
+}
+// --------------------------
 
 app.MapControllers();
 
-
-
 app.Run();
 
+// Required for WebApplicationFactory to access the Program class in tests
 public partial class Program { }
