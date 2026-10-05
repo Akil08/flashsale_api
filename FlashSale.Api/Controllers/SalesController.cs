@@ -23,17 +23,11 @@ public class SalesController : ControllerBase
         _logger = logger;
     }
 
-    // --- PUBLIC ENDPOINT (Cached) ---
     [HttpGet]
     public async Task<IActionResult> GetSales([FromQuery] string? search, CancellationToken cancellationToken)
     {
-        // 1. Create a unique cache key based on the search query
-        // so we just create a cache based on dynamic query ?
-        // This is a simple approach. For more complex queries, 
-        // consider hashing the query parameters to create a unique cache key.
         var cacheKey = string.IsNullOrEmpty(search) ? "sales:all" : $"sales:search:{search.ToLower()}";
 
-        // 2. Try to get from Redis cache first
         var cachedData = await _redisService.GetStringAsync(cacheKey, cancellationToken);
         if (!string.IsNullOrEmpty(cachedData))
         {
@@ -43,12 +37,21 @@ public class SalesController : ControllerBase
 
         _logger.LogInformation("Cache MISS for {CacheKey}. Fetching from DB.", cacheKey);
 
-        // 3. Fetch from database if not in cache
         var query = _dbContext.FlashSales.AsQueryable();
 
         if (!string.IsNullOrWhiteSpace(search))
         {
-            query = query.Where(s => s.Name.Contains(search) || s.Description.Contains(search));
+            // FUZZY SEARCH: Use trigram similarity. A threshold of 0.3 allows for slight misspellings.
+            // PostgreSQL will automatically use the GIN index we created in Step 28 for this.
+            // how to solve this eoror form vscode 
+            /*
+            'DbFunctions' does not contain a definition for 'TrigramSimilarity' and no accessible extension method 'TrigramSimilarity' accepting a first argument of type 'DbFunctions' could be found (are you missing a using directive or an assembly reference?)
+            tell me :
+            // EF
+            */
+           query = query.Where(s => 
+                EF.Functions.TrigramsSimilarity(s.Name, search) > 0.3 || 
+                EF.Functions.TrigramsSimilarity(s.Description, search) > 0.3);
         }
 
         var sales = await query
@@ -67,7 +70,6 @@ public class SalesController : ControllerBase
             })
             .ToListAsync(cancellationToken);
 
-        // 4. FIX: Force Web defaults (camelCase) for Redis serialization to match ASP.NET Core's Ok() behavior
         var serializerOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
         var jsonData = JsonSerializer.Serialize(sales, serializerOptions);
         
@@ -76,7 +78,6 @@ public class SalesController : ControllerBase
         return Ok(sales);
     }
 
-    // --- ADMIN ONLY ENDPOINTS ---
     [HttpPost]
     [Authorize(Roles = "Admin")]
     public async Task<IActionResult> CreateSale([FromBody] CreateSaleRequest request, CancellationToken cancellationToken)
@@ -100,7 +101,6 @@ public class SalesController : ControllerBase
         _dbContext.FlashSales.Add(newSale);
         await _dbContext.SaveChangesAsync(cancellationToken);
 
-        // Invalidate the "sales:all" cache when a new sale is created
         await _redisService.DeleteAsync("sales:all", cancellationToken);
 
         _logger.LogInformation("Admin created new flash sale: {SaleId} - {Name}", newSale.Id, newSale.Name);
